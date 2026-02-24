@@ -1,0 +1,16 @@
+# Virtual Environments
+venv/
+.venv/
+
+# Secret API Keys
+.env
+
+# ChromaDB Vector Database (Too large)
+ai_memory_db/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# OS generated files
+.DS_Store
