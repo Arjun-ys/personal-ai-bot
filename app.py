@@ -3,6 +3,8 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 import tempfile
+import fitz  # This is PyMuPDF
+from rapidocr_onnxruntime import RapidOCR
 from langchain_community.chat_models import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -52,36 +54,78 @@ st.sidebar.write("Upload documents (PDF, TXT, LOG) to give your AI long-term mem
 
 uploaded_file = st.sidebar.file_uploader("Choose a file...", type=['pdf', 'txt', 'log'])
 
+# Helper function for OCR (Optical Character Recognition)
+def get_text_from_scanned_pdf(pdf_path):
+    ocr = RapidOCR()
+    doc = fitz.open(pdf_path)
+    full_text = ""
+    
+    # Loop through every page in the PDF
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        
+        # 1. Convert the page to an image (Pixmap)
+        pix = page.get_pixmap()
+        img_bytes = pix.tobytes("png")
+        
+        # 2. Run AI recognition on the image
+        result, _ = ocr(img_bytes)
+        
+        # 3. Extract the text if found
+        if result:
+            for line in result:
+                full_text += line[1] + "\n"
+                
+    return full_text
+
 if uploaded_file is not None:
-    with st.spinner("Processing and memorizing..."):
-        # Create a temporary file to save the upload
+    with st.spinner("Processing... (If scanned, this may take a moment)"):
+        # Create a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             tmp_file_path = tmp_file.name
 
-        # Load the file based on type
         try:
-            if uploaded_file.name.endswith('.pdf'):
-                loader = PyPDFLoader(tmp_file_path)
-            else:
-                loader = TextLoader(tmp_file_path, encoding='utf-8') # Added encoding for safety
+            documents = []
             
-            documents = loader.load()
+            # CASE A: It's a PDF
+            if uploaded_file.name.endswith('.pdf'):
+                # First, try the standard fast loader
+                loader = PyPDFLoader(tmp_file_path)
+                documents = loader.load()
+                
+                # CHECK: Did we get empty text? (Indicates it's a scan)
+                if not documents or len(documents[0].page_content.strip()) < 10:
+                    st.sidebar.warning("Scanned document detected! Switching to AI OCR (Slower)...")
+                    
+                    # Run our custom OCR function
+                    scanned_text = get_text_from_scanned_pdf(tmp_file_path)
+                    
+                    # Manually wrap the text into a Document format for LangChain
+                    from langchain_core.documents import Document
+                    documents = [Document(page_content=scanned_text, metadata={"source": uploaded_file.name})]
 
-            # Split text into chunks for the database
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-            chunks = text_splitter.split_documents(documents)
+            # CASE B: Text or Log file
+            else:
+                loader = TextLoader(tmp_file_path, encoding='utf-8')
+                documents = loader.load()
 
-            # Save to ChromaDB
-            vectordb.add_documents(chunks)
-            st.sidebar.success(f"✅ Memorized {len(chunks)} chunks from {uploaded_file.name}!")
+            # Split text and save to memory
+            if documents and len(documents[0].page_content) > 0:
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                chunks = text_splitter.split_documents(documents)
+                vectordb.add_documents(chunks)
+                st.sidebar.success(f"✅ Memorized {len(chunks)} chunks from {uploaded_file.name}!")
+            else:
+                st.sidebar.error("Could not read any text from this file.")
         
         except Exception as e:
             st.sidebar.error(f"Error processing file: {e}")
         
         finally:
-            # Clean up the temp file
-            os.remove(tmp_file_path)
+            # Clean up
+            if os.path.exists(tmp_file_path):
+                os.remove(tmp_file_path)
 
 # --- 3. SET UP THE BRAIN (LLM + MEMORY) ---
 

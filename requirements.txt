@@ -10,3 +10,5 @@ langchain-google-genai
 langchain-classic
 langchain-text-splitters
 sentence-transformers
+pymupdf
+rapidocr-onnxruntime
