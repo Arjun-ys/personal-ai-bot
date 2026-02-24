@@ -4,10 +4,9 @@ langchain
 langchain-community
 langchain-huggingface
 pypdf
-tiktoken
 python-dotenv
 langchain-google-genai
-langchain-classic
+google-genai
 langchain-text-splitters
 sentence-transformers
 pymupdf
