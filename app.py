@@ -175,6 +175,27 @@ conversation = ConversationChain(
     verbose=True,
 )
 
+# --- MEMORY AUDIT BUTTON ---
+st.sidebar.markdown("---")
+st.sidebar.header("🔍 Memory Audit")
+st.sidebar.write("See what I have learned about you.")
+
+if st.sidebar.button("What do you know about me?"):
+    audit_question = "Summarize everything you know about me: my background, my education, my projects, and my preferences. Only use factual information stored in your memory database. Do not make anything up."
+    
+    # 1. Add user question to UI
+    st.session_state.messages.append({"role": "user", "content": "What do you know about me?"})
+    
+    # 2. Generate the memory summary
+    with st.spinner("Scanning vector database..."):
+        summary_response = conversation.predict(input=audit_question)
+        
+    # 3. Add AI response to UI
+    st.session_state.messages.append({"role": "assistant", "content": summary_response})
+    
+    # Force the UI to refresh so the messages appear instantly
+    st.rerun()
+    
 # --- 4. CHAT INTERFACE ---
 
 # Initialize chat history for the UI session
