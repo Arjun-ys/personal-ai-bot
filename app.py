@@ -538,28 +538,36 @@ else:
 # ╚══════════════════════════════════════════════════════╝
 
 prompt_template = ChatPromptTemplate.from_template(
-    """You are a personal AI agent — a persistent digital extension of your human partner.
-You grow smarter about them with every conversation. You are NOT a generic chatbot.
+    """You are not an assistant. You are the user's personal AI — a second brain that knows them deeply and grows with them over time.
 
-## WHAT YOU KNOW ABOUT THIS HUMAN (Core Identity)
+You talk like a sharp, trusted friend who happens to have perfect memory. Not a customer service bot, not a tutor, not a search engine.
+
+# WHO THIS HUMAN IS
 {identity_context}
 
-## FACTUAL DOCUMENT KNOWLEDGE (Uploaded Files — HIGH PRIORITY)
+# THEIR DOCUMENTS
 {doc_context}
 
-## PAST CONVERSATION MEMORY
+# THINGS YOU'VE TALKED ABOUT BEFORE
 {chat_context}
 
-## BEHAVIORAL DIRECTIVES
-1. Factual documents override conversational memory when facts conflict.
-2. Weave identity context naturally — reference their name, preferences, and background when relevant.
-3. If you know their tech stack preferences, tailor technical suggestions to match.
-4. Be honest when you don't know something. Suggest they upload a relevant document.
-5. Adapt your tone and depth to match their communication style over time.
-6. When presenting tabular data, preserve the original table structure in Markdown.
-7. Never fabricate personal details — only use what is in the context above.
+# RECENT CONVERSATION
+{recent_messages}
 
-## Current Exchange
+# YOUR PERSONALITY RULES
+- Talk like a real person. Short sentences when the question is simple. Longer when it's complex.
+- Never open with "Great question!" or "Sure!" or "Of course!" or "As your AI...". Just answer.
+- Never close with "Let me know if you need anything else!" or similar. Just stop when you're done.
+- If they ask something casual, be casual back. If they ask something technical, go deep.
+- Reference what you know about them naturally — don't announce it. If you know they prefer Python, just give Python examples without saying "since you prefer Python...".
+- If you genuinely don't know something, say "I don't have that" — don't hedge for three sentences.
+- Use their name rarely — only when it would feel natural in real speech.
+- Disagree when you have reason to. Don't be sycophantic.
+- When they share something personal, acknowledge it like a human would — briefly, warmly, then move on.
+- Markdown tables for tabular data. Code blocks for code. No formatting theater.
+- Facts from uploaded documents override anything from conversation memory.
+- NEVER fabricate personal details about them. If it's not in the context above, you don't know it.
+
 Human: {user_input}
 AI:"""
 )
@@ -625,6 +633,7 @@ if st.sidebar.button("🔎 Full Memory Audit"):
                 "doc_context": doc_context,
                 "chat_context": chat_context,
                 "identity_context": identity_context,
+                "recent_messages": "(Memory audit requested)",
                 "user_input": audit_question,
             }
         )
@@ -649,44 +658,42 @@ with st.sidebar.expander("🧬 View Known Facts About You"):
 
 
 # --- Memory Management ---
+
+# Show feedback from previous clear action (persists across rerun)
+if "clear_feedback" in st.session_state:
+    st.sidebar.success(st.session_state.clear_feedback)
+    del st.session_state.clear_feedback
+
+def _clear_collection(collection, label):
+    """Delete all documents from a ChromaDB collection in batches."""
+    try:
+        total_deleted = 0
+        while True:
+            result = collection.get(limit=5000)
+            ids = result["ids"]
+            if not ids:
+                break
+            collection.delete(ids=ids)
+            total_deleted += len(ids)
+        if total_deleted > 0:
+            st.session_state.clear_feedback = f"✅ {label} cleared ({total_deleted} entries removed)."
+        else:
+            st.session_state.clear_feedback = f"ℹ️ {label} is already empty."
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"Error clearing {label}: {e}")
+
 with st.sidebar.expander("⚠️ Memory Management"):
     st.caption("Clear specific memory banks. This cannot be undone.")
 
-    if st.button("🗑️ Clear Chat Memory"):
-        try:
-            ids = chat_db._collection.get()["ids"]
-            if ids:
-                chat_db._collection.delete(ids=ids)
-                st.success("Episodic memory cleared.")
-                st.rerun()
-            else:
-                st.info("Already empty.")
-        except Exception as e:
-            st.error(f"Error: {e}")
+    if st.button("🗑️ Clear Chat Memory", key="btn_clear_chat"):
+        _clear_collection(chat_db._collection, "Episodic memory")
 
-    if st.button("🗑️ Clear Identity Facts"):
-        try:
-            ids = identity_db._collection.get()["ids"]
-            if ids:
-                identity_db._collection.delete(ids=ids)
-                st.success("Identity facts cleared.")
-                st.rerun()
-            else:
-                st.info("Already empty.")
-        except Exception as e:
-            st.error(f"Error: {e}")
+    if st.button("🗑️ Clear Identity Facts", key="btn_clear_identity"):
+        _clear_collection(identity_db._collection, "Identity facts")
 
-    if st.button("🗑️ Clear Document Vault"):
-        try:
-            ids = doc_db._collection.get()["ids"]
-            if ids:
-                doc_db._collection.delete(ids=ids)
-                st.success("Document vault cleared.")
-                st.rerun()
-            else:
-                st.info("Already empty.")
-        except Exception as e:
-            st.error(f"Error: {e}")
+    if st.button("🗑️ Clear Document Vault", key="btn_clear_docs"):
+        _clear_collection(doc_db._collection, "Document vault")
 
 
 # ╔══════════════════════════════════════════════════════╗
@@ -727,6 +734,12 @@ if user_input := st.chat_input("What is on your mind?"):
                 ]
             )
 
+            # ── Build recent conversation window (last 6 turns for coherence) ──
+            recent_msgs = st.session_state.messages[-6:]
+            recent_messages = "\n".join(
+                [f"{'Human' if m['role'] == 'user' else 'AI'}: {m['content'][:500]}" for m in recent_msgs]
+            ) if recent_msgs else "(First message in this session)"
+
             # ── Stream the response ──
             chain = prompt_template | llm
 
@@ -738,6 +751,7 @@ if user_input := st.chat_input("What is on your mind?"):
                         "doc_context": doc_context,
                         "chat_context": chat_context,
                         "identity_context": identity_context,
+                        "recent_messages": recent_messages,
                         "user_input": user_input,
                     }
                 ):
@@ -753,6 +767,7 @@ if user_input := st.chat_input("What is on your mind?"):
                         "doc_context": doc_context,
                         "chat_context": chat_context,
                         "identity_context": identity_context,
+                        "recent_messages": recent_messages,
                         "user_input": user_input,
                     }
                 )
@@ -763,12 +778,19 @@ if user_input := st.chat_input("What is on your mind?"):
 
     st.session_state.messages.append({"role": "assistant", "content": response_text})
 
-    # ── ORGANIC LEARNING: Save to Episodic Memory (timestamped) ──
+    # ── ORGANIC LEARNING: Save to Episodic Memory (timestamped + tagged) ──
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    memory_string = f"[{timestamp}]\nHuman: {user_input}\nAI: {response_text}"
+    # Compact summary format — easier for retrieval than raw conversation
+    memory_string = f"[{timestamp}] User asked about: {user_input[:200]}\nAI response summary: {response_text[:300]}"
     chat_db.add_texts(
         [memory_string],
-        metadatas=[{"timestamp": datetime.now().isoformat(), "type": "conversation"}],
+        metadatas=[
+            {
+                "timestamp": datetime.now().isoformat(),
+                "type": "conversation",
+                "user_message": user_input[:500],
+            }
+        ],
     )
 
     # ── PASSIVE IDENTITY EXTRACTION: Mine facts in background ──
