@@ -488,6 +488,81 @@ If nothing found:
 
 
 # ╔══════════════════════════════════════════════════════╗
+# ║  4b. SOURCE-AWARE DOCUMENT RETRIEVAL                 ║
+# ║      When user asks about "my resume", fetch ALL     ║
+# ║      chunks from that doc — not just top-k.          ║
+# ╚══════════════════════════════════════════════════════╝
+
+def _match_document_source(query, sources):
+    """Check if the user's query references a known uploaded document."""
+    if not sources:
+        return None
+    query_lower = query.lower()
+
+    # Direct filename match (e.g. "arjun_resume" in query)
+    for src in sources:
+        stem = src.lower().rsplit(".", 1)[0].replace("_", " ").replace("-", " ")
+        if stem in query_lower or src.lower() in query_lower:
+            return src
+
+    # Type-keyword match (e.g. user says "resume" and we have "ArjunYS_Resume.pdf")
+    DOC_TYPE_KEYWORDS = {
+        "resume":      ["resume", "cv", "curriculum vitae"],
+        "marksheet":   ["marksheet", "marks", "transcript", "grade", "grades",
+                        "scorecard", "score card", "result"],
+        "certificate": ["certificate", "certification", "cert"],
+        "report":      ["report", "semester"],
+    }
+    for doc_type, keywords in DOC_TYPE_KEYWORDS.items():
+        if any(kw in query_lower for kw in keywords):
+            # Find a source whose filename matches this type
+            for src in sources:
+                src_lower = src.lower()
+                if doc_type in src_lower or any(kw in src_lower for kw in keywords):
+                    return src
+            break  # Matched keyword but no source filename — stop
+
+    return None
+
+
+def retrieve_from_vault(query, doc_db, default_k=5):
+    """
+    Smart document retrieval:
+    - If the query clearly references a specific uploaded document (by name or type),
+      retrieve ALL chunks from that document so the LLM sees the full picture.
+    - Otherwise, standard similarity search with default_k results.
+    """
+    # Collect all known source filenames in the vault
+    try:
+        meta_results = doc_db._collection.get(limit=5000, include=["metadatas"])
+        sources = {
+            m["source"] for m in (meta_results.get("metadatas") or []) if "source" in m
+        }
+    except Exception:
+        sources = set()
+
+    matched_source = _match_document_source(query, sources)
+
+    if matched_source:
+        try:
+            results = doc_db._collection.get(
+                where={"source": matched_source},
+                limit=100,
+                include=["documents", "metadatas"],
+            )
+            if results and results["documents"]:
+                return [
+                    Document(page_content=text, metadata=meta)
+                    for text, meta in zip(results["documents"], results["metadatas"])
+                ]
+        except Exception:
+            pass
+
+    # Default: similarity search
+    return doc_db.similarity_search(query, k=default_k)
+
+
+# ╔══════════════════════════════════════════════════════╗
 # ║  5. SIDEBAR — DOCUMENT INGESTION PIPELINE            ║
 # ╚══════════════════════════════════════════════════════╝
 
@@ -604,15 +679,12 @@ if uploaded_file is not None:
                     )
                     st.session_state.ingested_files.add(file_key)
 
-                    # === MINE PERSONAL FACTS from the document ===
-                    try:
-                        doc_facts = extract_facts_from_document(
-                            documents[0].page_content, uploaded_file.name, identity_db, llm
-                        )
-                        if doc_facts > 0:
-                            st.sidebar.info(f"🧬 Extracted **{doc_facts}** personal fact(s) from this document.")
-                    except Exception:
-                        pass  # Non-critical — don't block ingestion
+                    # === DEFER personal fact mining until LLM is initialized ===
+                    # (llm is defined in section 6, after this sidebar block)
+                    st.session_state["_pending_doc_facts"] = {
+                        "text": documents[0].page_content,
+                        "source": uploaded_file.name,
+                    }
                 else:
                     status.update(label="❌ No text found", state="error")
                     st.sidebar.error("Could not extract any text from this file.")
@@ -650,6 +722,19 @@ else:
         timeout=30,          # 30s hard timeout — prevents infinite retry on 429
         max_retries=2,       # Retry twice, then fail gracefully
     )
+
+
+# ── Process deferred document fact extraction (now that llm exists) ──
+if "_pending_doc_facts" in st.session_state:
+    _pending = st.session_state.pop("_pending_doc_facts")
+    try:
+        _doc_facts = extract_facts_from_document(
+            _pending["text"], _pending["source"], identity_db, llm
+        )
+        if _doc_facts > 0:
+            st.sidebar.info(f"🧬 Extracted **{_doc_facts}** personal fact(s) from **{_pending['source']}**.")
+    except Exception as e:
+        print(f"[Deferred Doc Fact Extraction Error] {e}")
 
 
 # ╔══════════════════════════════════════════════════════╗
@@ -731,7 +816,7 @@ if st.sidebar.button("🔎 Full Memory Audit"):
     )
 
     with st.spinner("Scanning all three memory banks..."):
-        docs = doc_db.similarity_search(audit_question, k=5)
+        docs = retrieve_from_vault(audit_question, doc_db, default_k=8)
         chats = chat_db.similarity_search(audit_question, k=5)
         identities = identity_db.similarity_search(audit_question, k=15)
 
@@ -835,7 +920,8 @@ if user_input := st.chat_input("What is on your mind?"):
         with st.spinner("Thinking..."):
 
             # ── Retrieve from all three memory banks ──
-            docs = doc_db.similarity_search(user_input, k=3)
+            # Source-aware: if user asks about "my resume", gets ALL resume chunks
+            docs = retrieve_from_vault(user_input, doc_db)
             chats = chat_db.similarity_search(user_input, k=3)
             identities = identity_db.similarity_search(user_input, k=5)
 
