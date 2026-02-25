@@ -6,7 +6,9 @@ import time
 from datetime import datetime
 from dotenv import load_dotenv
 import tempfile
+import threading
 import fitz  # PyMuPDF
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 # LangChain Imports
 from langchain_community.chat_models import ChatOllama
@@ -193,8 +195,8 @@ def extract_text_rapidocr_fallback(pdf_path):
 
 def smart_chunk_documents(documents):
     """
-    Split documents while keeping Markdown tables as atomic chunks.
-    Tables are NEVER split mid-row — they stay intact for clean vector retrieval.
+    Split documents while keeping Markdown tables AND code blocks as atomic chunks.
+    Tables/code are NEVER split mid-block. Each chunk carries its nearest section heading.
     """
     all_chunks = []
 
@@ -202,17 +204,31 @@ def smart_chunk_documents(documents):
         content = doc.page_content
         base_meta = doc.metadata.copy()
 
-        # Regex: match complete markdown table blocks (header + separator + rows)
-        table_pattern = r'(\|[^\n]+\|\n(?:\|[\s:|-]+\|\n)(?:\|[^\n]+\|\n?)*)'
-        parts = re.split(table_pattern, content)
+        # Regex: match markdown tables OR fenced code blocks as atomic units
+        # Tables: | col | col |\n|---|---|\n| data |...
+        # Code:   ```...```
+        atomic_pattern = r'(\|[^\n]+\|\n(?:\|[\s:|-]+\|\n)(?:\|[^\n]+\|\n?)*|```[^\n]*\n[\s\S]*?```)'
+        parts = re.split(atomic_pattern, content)
 
         chunk_docs = []
         text_buf = ""
+        current_section = ""  # Track nearest heading for context
 
         for part in parts:
-            is_table = bool(re.match(r'\s*\|[^\n]+\|', part.strip()))
+            stripped = part.strip()
+            is_table = bool(re.match(r'\s*\|[^\n]+\|', stripped))
+            is_code = stripped.startswith('```')
 
-            if is_table:
+            # Track section headings from text parts
+            if not is_table and not is_code:
+                # Find the last heading in this text segment
+                headings = re.findall(r'^(#{1,4}\s+.+)$', part, re.MULTILINE)
+                if headings:
+                    current_section = headings[-1].strip().lstrip('#').strip()
+
+            if is_table or is_code:
+                content_type = "table" if is_table else "code"
+
                 # Flush accumulated plain text first
                 if text_buf.strip():
                     splitter = RecursiveCharacterTextSplitter(
@@ -222,16 +238,16 @@ def smart_chunk_documents(documents):
                         chunk_docs.append(
                             Document(
                                 page_content=tc,
-                                metadata={**base_meta, "content_type": "text"},
+                                metadata={**base_meta, "content_type": "text",
+                                          "section": current_section},
                             )
                         )
                     text_buf = ""
 
                 # Large table? Split by row batches, preserve header
-                table_text = part.strip()
-                if len(table_text) > 3000:
-                    lines = table_text.split("\n")
-                    header_lines = lines[:2]  # header + separator
+                if is_table and len(stripped) > 3000:
+                    lines = stripped.split("\n")
+                    header_lines = lines[:2]
                     data_lines = lines[2:]
                     header = "\n".join(header_lines)
                     batch_size = 20
@@ -240,14 +256,16 @@ def smart_chunk_documents(documents):
                         chunk_docs.append(
                             Document(
                                 page_content=f"{header}\n{batch}",
-                                metadata={**base_meta, "content_type": "table"},
+                                metadata={**base_meta, "content_type": "table",
+                                          "section": current_section},
                             )
                         )
                 else:
                     chunk_docs.append(
                         Document(
-                            page_content=table_text,
-                            metadata={**base_meta, "content_type": "table"},
+                            page_content=stripped,
+                            metadata={**base_meta, "content_type": content_type,
+                                      "section": current_section},
                         )
                     )
             else:
@@ -262,7 +280,8 @@ def smart_chunk_documents(documents):
                 chunk_docs.append(
                     Document(
                         page_content=tc,
-                        metadata={**base_meta, "content_type": "text"},
+                        metadata={**base_meta, "content_type": "text",
+                                  "section": current_section},
                     )
                 )
 
@@ -317,20 +336,11 @@ If nothing found:
 )
 
 
-def _jaccard_similarity(text1, text2):
-    """Quick word-overlap similarity for deduplication."""
-    w1 = set(text1.lower().split())
-    w2 = set(text2.lower().split())
-    if not w1 or not w2:
-        return 0.0
-    return len(w1 & w2) / len(w1 | w2)
-
-
 def extract_personal_facts(user_input, ai_response, identity_db, llm):
     """
-    Background extraction: mine personal facts from the conversation turn,
-    deduplicate against existing identity store, and persist new ones.
-    Returns the count of newly stored facts.
+    Mine personal facts from a conversation turn, deduplicate against
+    existing identity store using ChromaDB's native vector distance,
+    and persist new/updated facts.
     """
     try:
         chain = FACT_EXTRACTION_PROMPT | llm
@@ -339,7 +349,6 @@ def extract_personal_facts(user_input, ai_response, identity_db, llm):
         )
 
         raw = result.content.strip()
-        # Extract JSON array even if wrapped in markdown fences
         json_match = re.search(r"\[.*\]", raw, re.DOTALL)
         if not json_match:
             return 0
@@ -357,32 +366,23 @@ def extract_personal_facts(user_input, ai_response, identity_db, llm):
             if len(fact_text) < 5:
                 continue
 
-            # Deduplication: skip if a very similar fact already exists
-            # If similar but not identical, UPDATE the old one (user may have changed preference)
+            # --- SEMANTIC DEDUPLICATION VIA CHROMADB VECTOR DISTANCE ---
             try:
-                existing = identity_db.similarity_search(fact_text, k=1)
-                if existing:
-                    sim = _jaccard_similarity(existing[0].page_content, fact_text)
-                    if sim > 0.85:
-                        # Near-duplicate — skip entirely
+                results = identity_db._collection.query(
+                    query_texts=[fact_text],
+                    n_results=1
+                )
+
+                if results and results["distances"] and results["distances"][0]:
+                    distance = results["distances"][0][0]
+                    closest_id = results["ids"][0][0]
+
+                    if distance < 0.4:
+                        # Near-identical semantic match — skip entirely
                         continue
-                    elif sim > 0.55:
+                    elif distance < 0.8:
                         # Similar topic but updated info — delete old, store new
-                        try:
-                            old_results = identity_db._collection.get(
-                                where={"category": fact.get("category", "general")},
-                                limit=10,
-                                include=["documents"]
-                            )
-                            if old_results and old_results["documents"]:
-                                for idx, old_doc in enumerate(old_results["documents"]):
-                                    if _jaccard_similarity(old_doc, fact_text) > 0.55:
-                                        identity_db._collection.delete(
-                                            ids=[old_results["ids"][idx]]
-                                        )
-                                        break
-                        except Exception:
-                            pass
+                        identity_db._collection.delete(ids=[closest_id])
             except Exception:
                 pass
 
@@ -400,10 +400,7 @@ def extract_personal_facts(user_input, ai_response, identity_db, llm):
 
         return stored
     except Exception as e:
-        # Log extraction failures for debugging (visible in terminal)
-        import traceback
         print(f"[Identity Extraction Error] {e}")
-        traceback.print_exc()
         return 0
 
 
@@ -464,11 +461,15 @@ If nothing found:
             if len(fact_text) < 5:
                 continue
 
-            # Dedup against existing facts
+            # Dedup via ChromaDB vector distance
             try:
-                existing = identity_db.similarity_search(fact_text, k=1)
-                if existing and _jaccard_similarity(existing[0].page_content, fact_text) > 0.75:
-                    continue
+                results = identity_db._collection.query(
+                    query_texts=[fact_text],
+                    n_results=1
+                )
+                if results and results["distances"] and results["distances"][0]:
+                    if results["distances"][0][0] < 0.4:
+                        continue  # Near-identical — skip
             except Exception:
                 pass
 
@@ -744,17 +745,32 @@ if llm_choice == "Local Offline (Llama 3)":
 else:
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.0-flash",
-        timeout=30,          # 30s hard timeout — prevents infinite retry on 429
-        max_retries=2,       # Retry twice, then fail gracefully
+        timeout=30,
+        max_retries=2,
     )
 
+# ── Dedicated extraction LLM: always Gemini Flash for structured JSON tasks ──
+# Fact extraction & document mining need reliable JSON output.
+# Chat LLM handles the conversation (local = private & free).
+# Extraction runs in background threads — API latency is invisible.
+_api_key = os.getenv("GOOGLE_API_KEY")
+if _api_key:
+    extraction_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        timeout=30,
+        max_retries=2,
+    )
+else:
+    # No API key — fall back to whatever chat model is selected
+    extraction_llm = llm
 
-# ── Process deferred document fact extraction (now that llm exists) ──
+
+# ── Process deferred document fact extraction (uses extraction_llm for JSON reliability) ──
 if "_pending_doc_facts" in st.session_state:
     _pending = st.session_state.pop("_pending_doc_facts")
     try:
         _doc_facts = extract_facts_from_document(
-            _pending["text"], _pending["source"], identity_db, llm
+            _pending["text"], _pending["source"], identity_db, extraction_llm
         )
         if _doc_facts > 0:
             st.sidebar.info(f"🧬 Extracted **{_doc_facts}** personal fact(s) from **{_pending['source']}**.")
@@ -922,6 +938,37 @@ with st.sidebar.expander("⚠️ Memory Management"):
     if st.button("🗑️ Clear Document Vault", key="btn_clear_docs"):
         _clear_collection(doc_db._collection, "Document vault")
 
+    # --- Per-document removal ---
+    st.markdown("---")
+    st.caption("Remove a single document:")
+    try:
+        _vault_meta = doc_db._collection.get(limit=5000, include=["metadatas"])
+        _vault_sources = sorted(
+            {m["source"] for m in (_vault_meta.get("metadatas") or []) if "source" in m}
+        )
+    except Exception:
+        _vault_sources = []
+
+    if _vault_sources:
+        _doc_to_remove = st.selectbox(
+            "Select document", _vault_sources, key="sel_doc_remove"
+        )
+        if st.button(f"🗑️ Remove \"{_doc_to_remove}\"", key="btn_remove_single_doc"):
+            try:
+                _hit = doc_db._collection.get(
+                    where={"source": _doc_to_remove}, limit=500
+                )
+                if _hit and _hit["ids"]:
+                    doc_db._collection.delete(ids=_hit["ids"])
+                    st.session_state.clear_feedback = (
+                        f"✅ Removed **{_doc_to_remove}** ({len(_hit['ids'])} chunks)."
+                    )
+                    st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Error removing document: {e}")
+    else:
+        st.caption("_No documents in vault._")
+
 
 # ╔══════════════════════════════════════════════════════╗
 # ║  9. CHAT INTERFACE — TRIPLE-MEMORY RETRIEVAL LOOP   ║
@@ -1016,10 +1063,9 @@ if user_input := st.chat_input("What is on your mind?"):
 
     st.session_state.messages.append({"role": "assistant", "content": response_text})
 
-    # ── ORGANIC LEARNING: Save to Episodic Memory (timestamped + tagged) ──
+    # ── ORGANIC LEARNING: Save FULL context to Episodic Memory ──
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    # Compact summary format — easier for retrieval than raw conversation
-    memory_string = f"[{timestamp}] User asked about: {user_input[:300]}\nAI response summary: {response_text[:500]}"
+    memory_string = f"[{timestamp}] User asked: {user_input}\nAI responded: {response_text}"
     chat_db.add_texts(
         [memory_string],
         metadatas=[
@@ -1031,7 +1077,14 @@ if user_input := st.chat_input("What is on your mind?"):
         ],
     )
 
-    # ── PASSIVE IDENTITY EXTRACTION: Mine facts in background ──
-    facts_stored = extract_personal_facts(user_input, response_text, identity_db, llm)
-    if facts_stored > 0:
-        st.toast(f"🧬 Learned {facts_stored} new fact(s) about you!", icon="🧠")
+    # ── PASSIVE IDENTITY EXTRACTION (NON-BLOCKING THREAD via Gemini Flash) ──
+    def run_background_extraction(u_input, ai_resp):
+        facts_stored = extract_personal_facts(u_input, ai_resp, identity_db, extraction_llm)
+        if facts_stored > 0:
+            print(f"🧬 Learned {facts_stored} new fact(s) about you!")
+
+    bg_thread = threading.Thread(
+        target=run_background_extraction, args=(user_input, response_text)
+    )
+    add_script_run_ctx(bg_thread)
+    bg_thread.start()
