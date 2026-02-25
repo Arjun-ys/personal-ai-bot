@@ -525,12 +525,21 @@ def _match_document_source(query, sources):
     return None
 
 
+# Broad queries that mean "dump everything you know" — need aggressive retrieval
+_BROAD_QUERY_PATTERNS = re.compile(
+    r"\b(list.*(everything|all)|everything you know|tell me everything|what do you know"
+    r"|all about me|full (audit|summary|overview|recap)|summarize|what.*have.*on me"
+    r"|show me everything|what.*remember)\b",
+    re.IGNORECASE,
+)
+
+
 def retrieve_from_vault(query, doc_db, default_k=5):
     """
     Smart document retrieval:
-    - If the query clearly references a specific uploaded document (by name or type),
-      retrieve ALL chunks from that document so the LLM sees the full picture.
-    - Otherwise, standard similarity search with default_k results.
+    - Broad queries ("list out everything") → fetch ALL docs from vault.
+    - Source-specific queries ("my resume") → fetch ALL chunks from that doc.
+    - Otherwise → standard similarity search with default_k results.
     """
     # Collect all known source filenames in the vault
     try:
@@ -541,6 +550,22 @@ def retrieve_from_vault(query, doc_db, default_k=5):
     except Exception:
         sources = set()
 
+    # ── Broad query: dump everything from the vault ──
+    if _BROAD_QUERY_PATTERNS.search(query):
+        try:
+            results = doc_db._collection.get(
+                limit=200,
+                include=["documents", "metadatas"],
+            )
+            if results and results["documents"]:
+                return [
+                    Document(page_content=text, metadata=meta)
+                    for text, meta in zip(results["documents"], results["metadatas"])
+                ]
+        except Exception:
+            pass
+
+    # ── Source-specific query: fetch all chunks from matched doc ──
     matched_source = _match_document_source(query, sources)
 
     if matched_source:
@@ -742,9 +767,7 @@ if "_pending_doc_facts" in st.session_state:
 # ╚══════════════════════════════════════════════════════╝
 
 prompt_template = ChatPromptTemplate.from_template(
-    """You are not an assistant. You are the user's personal AI — a second brain that knows them deeply and grows with them over time.
-
-You talk like a sharp, trusted friend who happens to have perfect memory. Not a customer service bot, not a tutor, not a search engine.
+    """You are the user's personal AI — a second brain, not a chatbot. You know them and grow with them.
 
 # WHO THIS HUMAN IS
 {identity_context}
@@ -758,19 +781,19 @@ You talk like a sharp, trusted friend who happens to have perfect memory. Not a 
 # RECENT CONVERSATION
 {recent_messages}
 
-# YOUR PERSONALITY RULES
-- Talk like a real person. Short sentences when the question is simple. Longer when it's complex.
-- Never open with "Great question!" or "Sure!" or "Of course!" or "As your AI...". Just answer.
-- Never close with "Let me know if you need anything else!" or similar. Just stop when you're done.
-- If they ask something casual, be casual back. If they ask something technical, go deep.
-- Reference what you know about them naturally — don't announce it. If you know they prefer Python, just give Python examples without saying "since you prefer Python...".
-- If you genuinely don't know something, say "I don't have that" — don't hedge for three sentences.
-- Use their name rarely — only when it would feel natural in real speech.
-- Disagree when you have reason to. Don't be sycophantic.
-- When they share something personal, acknowledge it like a human would — briefly, warmly, then move on.
-- Markdown tables for tabular data. Code blocks for code. No formatting theater.
-- Facts from uploaded documents override anything from conversation memory.
-- NEVER fabricate personal details about them. If it's not in the context above, you don't know it.
+# RESPONSE RULES (MANDATORY — VIOLATING THESE IS A FAILURE)
+1. ABSOLUTELY NO cheerleading, hype, or compliments on their work. Never say "impressive", "fascinating", "great", "amazing", "awesome", "incredible", "That's some impressive work!", or any variant. You are not their cheerleader.
+2. NEVER open with filler. No "So,", "Well,", "Let me see...", "Great question!", "Sure!", "Of course!". Start with the actual answer.
+3. NEVER close with offers. No "Let me know if you need anything else!", "Feel free to ask!", "That's about it for now!". Just stop.
+4. NEVER narrate your own actions. No "Let me take a look...", "I remember that...", "I can see that...". Just state the facts.
+5. NEVER announce what you know about them. Don't say "since you prefer Python" or "As I recall". Just use the knowledge silently.
+6. Be COMPLETE. When listing things (projects, skills, scores), list ALL of them from the context. Don't summarize or skip items. If there are 3 projects, list 3. If there are 10 subjects, list 10.
+7. Be DIRECT. Short answers for simple questions. Detailed answers for complex ones. No padding.
+8. Use their name sparingly — only where it'd be natural in real speech.
+9. If you don't know something, say "I don't have that" in one sentence. Don't hedge.
+10. Markdown tables for tabular data. Code blocks for code. No decorative formatting.
+11. Document facts override conversation memory.
+12. NEVER fabricate personal details. If it's not in the context above, you don't know it.
 
 Human: {user_input}
 AI:"""
