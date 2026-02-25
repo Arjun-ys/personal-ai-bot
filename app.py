@@ -358,10 +358,31 @@ def extract_personal_facts(user_input, ai_response, identity_db, llm):
                 continue
 
             # Deduplication: skip if a very similar fact already exists
+            # If similar but not identical, UPDATE the old one (user may have changed preference)
             try:
                 existing = identity_db.similarity_search(fact_text, k=1)
-                if existing and _jaccard_similarity(existing[0].page_content, fact_text) > 0.75:
-                    continue
+                if existing:
+                    sim = _jaccard_similarity(existing[0].page_content, fact_text)
+                    if sim > 0.85:
+                        # Near-duplicate — skip entirely
+                        continue
+                    elif sim > 0.55:
+                        # Similar topic but updated info — delete old, store new
+                        try:
+                            old_results = identity_db._collection.get(
+                                where={"category": fact.get("category", "general")},
+                                limit=10,
+                                include=["documents"]
+                            )
+                            if old_results and old_results["documents"]:
+                                for idx, old_doc in enumerate(old_results["documents"]):
+                                    if _jaccard_similarity(old_doc, fact_text) > 0.55:
+                                        identity_db._collection.delete(
+                                            ids=[old_results["ids"][idx]]
+                                        )
+                                        break
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -378,7 +399,91 @@ def extract_personal_facts(user_input, ai_response, identity_db, llm):
             stored += 1
 
         return stored
-    except Exception:
+    except Exception as e:
+        # Log extraction failures for debugging (visible in terminal)
+        import traceback
+        print(f"[Identity Extraction Error] {e}")
+        traceback.print_exc()
+        return 0
+
+
+def extract_facts_from_document(doc_text, source_name, identity_db, llm):
+    """
+    Mine personal facts from an uploaded document (e.g. resume, transcript).
+    Called once at ingestion time — not on every chat.
+    """
+    DOC_FACT_PROMPT = ChatPromptTemplate.from_template(
+        """Extract personal facts about the document owner from this uploaded document.
+
+<document source="{source_name}">
+{doc_text}
+</document>
+
+Extract facts into these categories:
+- identity: name, age, DOB, location, nationality, occupation, education, university, degree
+- skills: programming languages, tools, frameworks, certifications, academic scores
+- projects: project names, descriptions, technologies used
+- preferences: stated preferences, tools used repeatedly
+- personal: hobbies, interests, achievements, awards
+
+RULES:
+- Only extract facts that clearly belong to the document owner (not third parties).
+- Each fact must be a complete, standalone sentence.
+- Be specific with numbers: GPA, scores, percentages, dates.
+- If this is a marksheet, extract: student name, institution, subjects with scores, total/percentage.
+- If this is a resume, extract: name, education history, skills, project summaries.
+- If NO personal facts are present, return an empty array.
+
+Return ONLY a valid JSON array:
+[{{"category": "...", "fact": "..."}}]
+
+If nothing found:
+[]"""
+    )
+
+    try:
+        # Take first 3000 chars to stay within token limits
+        trimmed = doc_text[:3000]
+        chain = DOC_FACT_PROMPT | llm
+        result = chain.invoke({"doc_text": trimmed, "source_name": source_name})
+
+        raw = result.content.strip()
+        json_match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if not json_match:
+            return 0
+
+        facts = json.loads(json_match.group())
+        if not facts or not isinstance(facts, list):
+            return 0
+
+        stored = 0
+        for fact in facts:
+            if not isinstance(fact, dict) or "fact" not in fact:
+                continue
+            fact_text = fact["fact"].strip()
+            if len(fact_text) < 5:
+                continue
+
+            # Dedup against existing facts
+            try:
+                existing = identity_db.similarity_search(fact_text, k=1)
+                if existing and _jaccard_similarity(existing[0].page_content, fact_text) > 0.75:
+                    continue
+            except Exception:
+                pass
+
+            identity_db.add_texts(
+                [fact_text],
+                metadatas=[{
+                    "category": fact.get("category", "general"),
+                    "extracted_at": datetime.now().isoformat(),
+                    "source_document": source_name,
+                }],
+            )
+            stored += 1
+        return stored
+    except Exception as e:
+        print(f"[Document Fact Extraction Error] {e}")
         return 0
 
 
@@ -498,6 +603,16 @@ if uploaded_file is not None:
                         f"📝 Text chunks: {text_chunks}  •  📊 Table chunks: {table_chunks}"
                     )
                     st.session_state.ingested_files.add(file_key)
+
+                    # === MINE PERSONAL FACTS from the document ===
+                    try:
+                        doc_facts = extract_facts_from_document(
+                            documents[0].page_content, uploaded_file.name, identity_db, llm
+                        )
+                        if doc_facts > 0:
+                            st.sidebar.info(f"🧬 Extracted **{doc_facts}** personal fact(s) from this document.")
+                    except Exception:
+                        pass  # Non-critical — don't block ingestion
                 else:
                     status.update(label="❌ No text found", state="error")
                     st.sidebar.error("Could not extract any text from this file.")
@@ -530,7 +645,11 @@ if llm_choice == "Local Offline (Llama 3)":
         st.error("⚠️ Cannot connect to Ollama. Make sure it is running (`ollama serve`).")
         st.stop()
 else:
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        timeout=30,          # 30s hard timeout — prevents infinite retry on 429
+        max_retries=2,       # Retry twice, then fail gracefully
+    )
 
 
 # ╔══════════════════════════════════════════════════════╗
@@ -734,8 +853,8 @@ if user_input := st.chat_input("What is on your mind?"):
                 ]
             )
 
-            # ── Build recent conversation window (last 6 turns for coherence) ──
-            recent_msgs = st.session_state.messages[-6:]
+            # ── Build recent conversation window (last 6 turns, excluding current) ──
+            recent_msgs = st.session_state.messages[-7:-1]  # Exclude the just-added user message
             recent_messages = "\n".join(
                 [f"{'Human' if m['role'] == 'user' else 'AI'}: {m['content'][:500]}" for m in recent_msgs]
             ) if recent_msgs else "(First message in this session)"
@@ -760,19 +879,29 @@ if user_input := st.chat_input("What is on your mind?"):
                     response_placeholder.markdown(full_response + "▌")
 
                 response_placeholder.markdown(full_response)
-            except Exception:
+            except Exception as stream_err:
                 # Fallback to non-streaming if streaming fails
-                response_message = chain.invoke(
-                    {
-                        "doc_context": doc_context,
-                        "chat_context": chat_context,
-                        "identity_context": identity_context,
-                        "recent_messages": recent_messages,
-                        "user_input": user_input,
-                    }
-                )
-                full_response = response_message.content
-                response_placeholder.markdown(full_response)
+                try:
+                    response_message = chain.invoke(
+                        {
+                            "doc_context": doc_context,
+                            "chat_context": chat_context,
+                            "identity_context": identity_context,
+                            "recent_messages": recent_messages,
+                            "user_input": user_input,
+                        }
+                    )
+                    full_response = response_message.content
+                    response_placeholder.markdown(full_response)
+                except Exception as invoke_err:
+                    error_msg = str(invoke_err)
+                    if "429" in error_msg or "quota" in error_msg.lower():
+                        full_response = "⚠️ API quota exceeded. Either wait a few minutes or switch to **Local Offline (Llama 3)** in the sidebar."
+                    elif "timeout" in error_msg.lower():
+                        full_response = "⚠️ Request timed out. The API might be overloaded — try again or switch to local mode."
+                    else:
+                        full_response = f"⚠️ Error getting response: {error_msg[:200]}"
+                    response_placeholder.markdown(full_response)
 
             response_text = full_response
 
@@ -781,7 +910,7 @@ if user_input := st.chat_input("What is on your mind?"):
     # ── ORGANIC LEARNING: Save to Episodic Memory (timestamped + tagged) ──
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     # Compact summary format — easier for retrieval than raw conversation
-    memory_string = f"[{timestamp}] User asked about: {user_input[:200]}\nAI response summary: {response_text[:300]}"
+    memory_string = f"[{timestamp}] User asked about: {user_input[:300]}\nAI response summary: {response_text[:500]}"
     chat_db.add_texts(
         [memory_string],
         metadatas=[
