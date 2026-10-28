@@ -10,7 +10,7 @@ import threading
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 # LangChain Imports
-from langchain_community.chat_models import ChatOllama
+from langchain_ollama import ChatOllama
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import TextLoader

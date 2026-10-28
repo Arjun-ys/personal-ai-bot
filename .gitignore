@@ -6,7 +6,7 @@ venv/
 .env
 
 # ChromaDB Vector Database (Too large)
-ai_memory_db/
+ai_memory_db*/
 
 # Python Cache
 __pycache__/

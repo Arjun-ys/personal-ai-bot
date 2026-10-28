@@ -1,8 +1,10 @@
 streamlit
 chromadb
 langchain
-langchain-community
+langchain-chroma
 langchain-huggingface
+langchain-ollama
+pydantic>=2.0.0
 pypdf
 python-dotenv
 langchain-google-genai

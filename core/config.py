@@ -15,7 +15,7 @@ EPISODIC_DIR = os.path.join(PERSIST_DIR, "episodic")
 IDENTITY_DIR = os.path.join(PERSIST_DIR, "identity")
 
 PAGE_TITLE = "Personal AI Agent"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 GEMINI_VISION_MODEL = "gemini-2.5-flash"
 
 

@@ -1,12 +1,16 @@
 """Diagnostic: inspect core_identity ChromaDB collection."""
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+embeddings = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-small-en-v1.5",
+    encode_kwargs={"normalize_embeddings": True}
+)
 identity_db = Chroma(
     collection_name="core_identity",
     persist_directory="./ai_memory_db",
     embedding_function=embeddings,
+    collection_metadata={"hnsw:space": "cosine"},
 )
 
 col = identity_db._collection

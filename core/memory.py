@@ -1,6 +1,6 @@
 from datetime import datetime
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from core.config import (
@@ -14,13 +14,17 @@ from core.config import (
 
 def init_databases(persist_dir=PERSIST_DIR, embedding_model=EMBEDDING_MODEL):
     """Initialize three isolated ChromaDB collections for the memory system."""
-    embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
+    embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-small-en-v1.5",
+        encode_kwargs={"normalize_embeddings": True}
+    )
 
     # Collection A: THE VAULT — Strictly for uploaded documents (PDF, TXT, LOG)
     doc_db = Chroma(
         persist_directory=persist_dir,
         embedding_function=embeddings,
         collection_name="document_vault",
+        collection_metadata={"hnsw:space": "cosine"},
     )
 
     # Collection B: EPISODIC MEMORY — Every chat turn is saved here
@@ -28,6 +32,7 @@ def init_databases(persist_dir=PERSIST_DIR, embedding_model=EMBEDDING_MODEL):
         persist_directory=persist_dir,
         embedding_function=embeddings,
         collection_name="episodic_memory",
+        collection_metadata={"hnsw:space": "cosine"},
     )
 
     # Collection C: CORE IDENTITY — Extracted personal facts & preferences
@@ -36,6 +41,7 @@ def init_databases(persist_dir=PERSIST_DIR, embedding_model=EMBEDDING_MODEL):
         persist_directory=persist_dir,
         embedding_function=embeddings,
         collection_name="core_identity",
+        collection_metadata={"hnsw:space": "cosine"},
     )
 
     return doc_db, chat_db, identity_db
@@ -81,11 +87,13 @@ _detect_referenced_sources = _match_document_source
 
 def _recency_boosted_episodic_search(query, chat_db, k=8):
     """
-    Fetch episodic memories with recency boost.
+    Fetch episodic memories with recency boost and full-turn reconstruction.
     1. Pull more results than needed (2x k) via similarity search.
     2. Sort by timestamp descending — recent memories float to top.
     3. Return top k results.
-    This ensures the AI remembers recent conversations better.
+    4. For each unique turn_id in the selected results (excluding role == "system_summary"),
+       fetch both user and assistant chunks, sort user before assistant, and combine them.
+       Deduplicate by turn_id.
     """
     try:
         candidates = chat_db.similarity_search(query, k=k * 2)
@@ -101,7 +109,49 @@ def _recency_boosted_episodic_search(query, chat_db, k=8):
                 return datetime.min
 
         candidates.sort(key=_get_ts, reverse=True)
-        return candidates[:k]
+        top_candidates = candidates[:k]
+
+        final_results = []
+        seen_turn_ids = set()
+
+        for doc in top_candidates:
+            role = doc.metadata.get("role")
+            turn_id = doc.metadata.get("turn_id")
+
+            # Exclude role == "system_summary" which should be returned as-is
+            if role == "system_summary" or not turn_id:
+                final_results.append(doc)
+                continue
+
+            if turn_id in seen_turn_ids:
+                continue
+            seen_turn_ids.add(turn_id)
+
+            try:
+                turn_data = chat_db._collection.get(
+                    where={"turn_id": turn_id},
+                    include=["documents", "metadatas"],
+                )
+                docs_list = turn_data.get("documents") or []
+                metas_list = turn_data.get("metadatas") or []
+                if docs_list:
+                    pairs = list(zip(docs_list, metas_list))
+                    # Sort so user comes before assistant
+                    pairs.sort(key=lambda p: 0 if p[1].get("role") == "user" else (1 if p[1].get("role") == "assistant" else 2))
+                    user_chunk = next((p for p in pairs if p[1].get("role") == "user"), None)
+                    ai_chunk = next((p for p in pairs if p[1].get("role") == "assistant"), None)
+                    if user_chunk and ai_chunk:
+                        combined_text = f"{user_chunk[0]}\n{ai_chunk[0]}"
+                    else:
+                        combined_text = "\n".join(p[0] for p in pairs)
+                    combined_meta = (user_chunk or pairs[0])[1].copy()
+                    final_results.append(Document(page_content=combined_text, metadata=combined_meta))
+                else:
+                    final_results.append(doc)
+            except Exception:
+                final_results.append(doc)
+
+        return final_results
     except Exception:
         return chat_db.similarity_search(query, k=k)
 
